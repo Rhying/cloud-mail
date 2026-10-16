@@ -1,0 +1,59 @@
+name: 🔄 自动同步上游
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"  # 每 6 小时检查一次
+  workflow_dispatch:        # 支持手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 配置 Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 添加上游并拉取
+        run: |
+          git remote add upstream https://github.com/maillab/cloud-mail.git 2>/dev/null || true
+          git fetch upstream main
+
+      - name: 检查是否有更新
+        id: check
+        run: |
+          LOCAL=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse upstream/main)
+          if [ "$LOCAL" = "$UPSTREAM" ]; then
+            echo "has_update=false" >> $GITHUB_OUTPUT
+            echo "已是最新，无需同步。"
+          else
+            echo "has_update=true" >> $GITHUB_OUTPUT
+            echo "发现上游更新，开始同步..."
+          fi
+
+      - name: 合并上游更新
+        if: steps.check.outputs.has_update == 'true'
+        run: |
+          # -X ours: 冲突时保留本地版本（保护 wrangler.toml 绑定配置）
+          git merge upstream/main --no-edit -X ours
+
+          # 双重检查：确保 wrangler.toml 的绑定没被上游注释掉
+          if grep -q "^#\[\[d1_databases\]\]" mail-worker/wrangler.toml; then
+            echo "wrangler.toml 被上游覆盖，恢复绑定版本..."
+            git checkout HEAD -- mail-worker/wrangler.toml
+            git add mail-worker/wrangler.toml
+            git commit --amend --no-edit
+          fi
+
+      - name: 推送到 fork
+        if: steps.check.outputs.has_update == 'true'
+        run: git push origin main

@@ -1,11 +1,6 @@
 name: 🚀 Deploy cloud-mail to Cloudflare Workers
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - "mail-worker/**"
-      - "mail-vue/**"
   workflow_dispatch:
 
 jobs:
