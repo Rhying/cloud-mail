@@ -1,0 +1,90 @@
+name: 🔄 自动同步上游
+
+on:
+  schedule:
+    - cron: "0 0 * * 1"     # 每周一次：周一 00:00 UTC（北京时间周一 08:00）
+  workflow_dispatch:        # 支持手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 配置 Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 添加上游并拉取
+        run: |
+          git remote add upstream https://github.com/maillab/cloud-mail.git 2>/dev/null || true
+          git fetch upstream main
+
+      - name: 判断上游是否有新提交
+        id: check
+        run: |
+          # 不能比 SHA 相等：fork 的 HEAD 是重建的单条提交，SHA 永远不等于上游单提交。
+          # 只用「上游是否已全部包含在本分支」来判断，才幂等。
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+            echo "已包含上游全部提交，无需同步。"
+          else
+            echo "has_update=true" >> "$GITHUB_OUTPUT"
+            echo "发现上游新提交 $(git rev-parse --short upstream/main)，开始同步..."
+          fi
+
+      - name: 生成单条 fork 提交
+        if: steps.check.outputs.has_update == 'true'
+        run: |
+          BEFORE=$(git rev-parse HEAD)
+
+          # 1) 把上游内容并入工作区；冲突时保留本地版本（-X ours），且 --squash 不产生 merge commit
+          git merge --squash -X ours upstream/main
+
+          # 2) 不接收上游对 workflow 的改动：GITHUB_TOKEN 没有 workflows 权限，
+          #    推送时改动 workflow 文件会被拒绝（GH006）；保持与推送前完全一致即可绕过
+          rm -rf .github/workflows
+          git checkout "$BEFORE" -- .github/workflows
+
+          # 3) 护栏：wrangler.toml 是 fork 用来解决「CF 更新部署后 d1/kv 绑定丢失」的关键——
+          #    里面用 ${D1_DATABASE_ID} / ${KV_NAMESPACE_ID} 占位，让 CF 每次构建都重新注入同一组 ID。
+          #    上游一旦改动该文件，一律回滚到 fork 版本，避免占位被写死 id 或注释掉。
+          if ! git diff --quiet "$BEFORE" -- mail-worker/wrangler.toml; then
+            echo "::warning::上游改动了 wrangler.toml，已回滚到 fork 版本（保护 D1/KV 绑定占位）"
+            git checkout "$BEFORE" -- mail-worker/wrangler.toml
+          fi
+          # 兜底：占位符必须存在，否则硬回滚
+          if ! grep -q 'D1_DATABASE_ID' mail-worker/wrangler.toml \
+             || ! grep -q 'KV_NAMESPACE_ID' mail-worker/wrangler.toml; then
+            echo "::error::wrangler.toml 丢失 D1/KV 占位，回滚到 fork 版本"
+            git checkout "$BEFORE" -- mail-worker/wrangler.toml
+          fi
+
+          git add -A
+
+          # 4) 重建历史：HEAD 直接挂到 upstream/main 上，索引保留合并后的完整内容，
+          #    一次提交 → 非上游提交始终只有一条
+          git reset --soft upstream/main
+          git commit --allow-empty \
+            -m "chore(sync): 同步上游 $(git rev-parse --short upstream/main) 并保留 fork 定制" \
+            -m "同步时间（UTC）：$(date -u '+%Y-%m-%d %H:%M')" \
+            -m "- 上游 base: $(git rev-parse --short upstream/main)" \
+            -m "- 保留 mail-worker/wrangler.toml 的 D1/KV/R2/Email 绑定" \
+            -m "- 保留 .github/workflows 与 mail-worker/cf-deploy.sh、mail-vue/.env.release 的 fork 定制"
+
+      - name: 推送到 fork
+        if: steps.check.outputs.has_update == 'true'
+        run: |
+          # 历史被重建，必须强制推送；--force-with-lease 保证不会覆盖别人新推的提交
+          git push --force-with-lease origin main
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
